@@ -17,10 +17,22 @@
 	},
 
 	"ai": {
-		"binding": "Workers"
+		"binding": "AI"
 	},
 
-	"version_metadata": {
-		"binding": "WorkersVersion"
-	}
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "ChatAgent",
+				"class_name": "ChatAgent"
+			}
+		]
+	},
+
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["ChatAgent"]
+		}
+	]
 }
