@@ -1,172 +1,124 @@
-import { Hono } from "hono";
+import { AIChatAgent } from "@cloudflare/ai-chat";
+import { routeAgentRequest } from "agents";
+import { createWorkersAI } from "workers-ai-provider";
+import {
+	streamText,
+	convertToModelMessages,
+	pruneMessages,
+	tool,
+	stepCountIs,
+} from "ai";
+import { z } from "zod";
 
-type Bindings = {
-	AI: Ai;
-};
+export class ChatAgent extends AIChatAgent {
+	async onChatMessage() {
+		const workersai = createWorkersAI({
+			binding: this.env.AI,
+		});
 
-type ChatMessage = {
-	role: "system" | "user" | "assistant";
-	content: string;
-};
+		const result = streamText({
+			model: workersai(
+				"@cf/meta/llama-4-scout-17b-16e-instruct",
+			),
 
-const app = new Hono<{ Bindings: Bindings }>();
+			system: `
+You are FLYTRIPVISA AI, an intelligent travel and visa assistant.
 
-/**
- * Health check
- */
-app.get("/api/health", (c) => {
-	return c.json({
-		ok: true,
-		service: "FLYTRIPVISA AI",
-		status: "online",
-		time: new Date().toISOString(),
-	});
-});
+Your job is to help users with:
+- Visa information
+- Travel planning
+- Flight information
+- Hotel information
+- Destinations
+- Travel documents
+- Visa application guidance
+- General immigration and travel questions
 
-/**
- * Basic API test
- */
-app.get("/api/", (c) => {
-	return c.json({
-		name: "FLYTRIPVISA AI",
-		status: "online",
-	});
-});
-
-/**
- * AI Chat API
- *
- * POST /api/chat
- *
- * Body:
- * {
- *   "messages": [
- *     {
- *       "role": "user",
- *       "content": "Hello"
- *     }
- *   ]
- * }
- */
-app.post("/api/chat", async (c) => {
-	try {
-		const body = await c.req.json<{
-			messages?: ChatMessage[];
-		}>();
-
-		if (!body.messages || !Array.isArray(body.messages)) {
-			return c.json(
-				{
-					error: "messages array is required",
-				},
-				400,
-			);
-		}
-
-		const messages = body.messages
-			.filter(
-				(message) =>
-					message &&
-					["system", "user", "assistant"].includes(message.role) &&
-					typeof message.content === "string",
-			)
-			.map((message) => ({
-				role: message.role,
-				content: message.content.trim(),
-			}))
-			.filter((message) => message.content.length > 0);
-
-		if (messages.length === 0) {
-			return c.json(
-				{
-					error: "At least one valid message is required",
-				},
-				400,
-			);
-		}
-
-		/**
-		 * System instruction for FLYTRIPVISA AI
-		 */
-		const systemMessage: ChatMessage = {
-			role: "system",
-			content: `
-You are FLYTRIPVISA AI, a helpful travel and visa assistant.
-
-Your responsibilities:
-- Help users with travel and visa-related questions.
-- Explain visa requirements clearly.
-- Help users understand travel documents and application processes.
-- Provide flight, hotel, destination and travel-planning guidance.
-- Be concise, friendly and professional.
-- Never claim that a visa is guaranteed.
-- If information may have changed, clearly tell the user that they should verify the latest official requirements.
-- Do not invent government requirements, fees, processing times or immigration rules.
-
-Always answer in the same language as the user's latest message when practical.
+Rules:
+- Be helpful, professional and concise.
+- Answer in the same language as the user whenever possible.
+- Never guarantee visa approval.
+- Never invent visa requirements, fees or government policies.
+- If information may have changed, tell the user to verify it with the relevant official authority.
+- Clearly distinguish general guidance from official immigration advice.
 			`.trim(),
-		};
 
-		/**
-		 * Prevent duplicate system messages.
-		 */
-		const modelMessages: ChatMessage[] = [
-			systemMessage,
-			...messages.filter((message) => message.role !== "system"),
-		];
+			messages: pruneMessages({
+				messages: await convertToModelMessages(this.messages),
+				toolCalls: "before-last-2-messages",
+			}),
 
-		/**
-		 * Workers AI model.
-		 *
-		 * You can change this model later without changing
-		 * the frontend API.
-		 */
-		const model = "@cf/meta/llama-3.1-8b-instruct";
+			tools: {
+				getUserTimezone: tool({
+					description:
+						"Get the user's timezone and local time from their browser.",
+					inputSchema: z.object({}),
+				}),
 
-		/**
-		 * Streaming Workers AI response.
-		 */
-		const result = await c.env.AI.run(model, {
-			messages: modelMessages,
-			stream: true,
+				calculate: tool({
+					description:
+						"Perform a mathematical calculation.",
+					inputSchema: z.object({
+						a: z.coerce
+							.number()
+							.describe("First number"),
+
+						b: z.coerce
+							.number()
+							.describe("Second number"),
+
+						operator: z
+							.enum(["+", "-", "*", "/", "%"])
+							.describe("Arithmetic operator"),
+					}),
+
+					needsApproval: async ({ a, b }) =>
+						Math.abs(a) > 1000 || Math.abs(b) > 1000,
+
+					execute: async ({
+						a,
+						b,
+						operator,
+					}) => {
+						if (operator === "/" && b === 0) {
+							return {
+								error: "Division by zero",
+							};
+						}
+
+						const operations: Record<
+							string,
+							(x: number, y: number) => number
+						> = {
+							"+": (x, y) => x + y,
+							"-": (x, y) => x - y,
+							"*": (x, y) => x * y,
+							"/": (x, y) => x / y,
+							"%": (x, y) => x % y,
+						};
+
+						return {
+							expression: `${a} ${operator} ${b}`,
+							result: operations[operator](a, b),
+						};
+					},
+				}),
+			},
+
+			stopWhen: stepCountIs(5),
 		});
 
-		return new Response(result as ReadableStream, {
-			headers: {
-				"Content-Type": "text/event-stream; charset=utf-8",
-				"Cache-Control": "no-cache, no-transform",
-				"Connection": "keep-alive",
-				"X-Accel-Buffering": "no",
-			},
-		});
-	} catch (error) {
-		console.error("AI chat error:", error);
-
-		return c.json(
-			{
-				error: "Unable to process the AI request",
-				message:
-					error instanceof Error
-						? error.message
-						: "Unknown error",
-			},
-			500,
-		);
+		return result.toUIMessageStreamResponse();
 	}
-});
+}
 
-/**
- * CORS
- */
-app.options("*", (c) => {
-	return new Response(null, {
-		status: 204,
-		headers: {
-			"Access-Control-Allow-Origin": "*",
-			"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-			"Access-Control-Allow-Headers": "Content-Type",
-		},
-	});
-});
-
-export default app;
+export default {
+	async fetch(request: Request, env: Env) {
+		return (
+			(await routeAgentRequest(request, env)) ||
+			new Response("Not found", {
+				status: 404,
+			})
+		);
+	},
+} satisfies ExportedHandler<Env>;
